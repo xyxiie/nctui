@@ -25,7 +25,7 @@ non-privileged connect scans; no root is needed.
 Clone the repository and build the release binary:
 
 ```sh
-git clone <repository-url> nctui
+git clone https://github.com/xyxiie/nctui nctui
 cd nctui
 cargo build --release
 ln -sfn "$PWD/target/release/nctui" ~/.local/bin/nctui   # or copy it onto your PATH
@@ -34,7 +34,7 @@ ln -sfn "$PWD/target/release/nctui" ~/.local/bin/nctui   # or copy it onto your 
 Or let Cargo build and install it straight from the repository:
 
 ```sh
-cargo install --git <repository-url>
+cargo install --git https://github.com/xyxiie/nctui
 ```
 
 Either way you end up with an `nctui` command; `nctui --help` lists the options.

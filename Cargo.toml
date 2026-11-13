@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
 license = "MIT"
+repository = "https://github.com/xyxiie/nctui"
 description = "Fast terminal UI that finds open Minecraft servers with a built-in scanner and nmap"
 
 [dependencies]
