@@ -46,6 +46,14 @@ pub fn status(host: &str, port: u16) -> Result<Status, ProbeError> {
     let value: Value = serde_json::from_slice(&json)
         .map_err(|_| ProbeError("not a Minecraft status response".to_string()))?;
 
+    // The login handshake must repeat the protocol version the server
+    // advertises here; vanilla disconnects clients that send another one.
+    let protocol = value
+        .pointer("/version/protocol")
+        .and_then(Value::as_i64)
+        .and_then(|protocol| i32::try_from(protocol).ok())
+        .unwrap_or(-1);
+
     Ok(Status {
         version: value
             .pointer("/version/name")
@@ -67,7 +75,7 @@ pub fn status(host: &str, port: u16) -> Result<Status, ProbeError> {
                 .unwrap_or_default(),
         ),
         latency_ms,
-        online_mode: online_mode(host, port).unwrap_or(OnlineMode::Unknown),
+        online_mode: online_mode(host, port, protocol).unwrap_or(OnlineMode::Unknown),
     })
 }
 
@@ -95,10 +103,13 @@ fn connect(host: &str, port: u16) -> Result<TcpStream, ProbeError> {
 ///
 /// The probe never authenticates and disconnects right after the first reply, so
 /// the username may briefly show up in the server's log.
-pub fn online_mode(host: &str, port: u16) -> Result<OnlineMode, ProbeError> {
+///
+/// `protocol` must be the version the server advertised in its status response:
+/// a mismatched version is rejected before either packet, hiding the mode.
+pub fn online_mode(host: &str, port: u16, protocol: i32) -> Result<OnlineMode, ProbeError> {
     let mut stream = connect(host, port)?;
     stream
-        .write_all(&login_request(host, port))
+        .write_all(&login_request(host, port, protocol))
         .map_err(|err| ProbeError(io_message(&err)))?;
 
     let length = read_varint(&mut stream).map_err(|err| ProbeError(io_message(&err)))?;
@@ -157,21 +168,33 @@ fn status_request() -> Vec<u8> {
 }
 
 /// A handshake asking for the login state plus a Login Start packet.
-fn login_request(host: &str, port: u16) -> Vec<u8> {
+///
+/// The handshake repeats the server's advertised protocol version, and the
+/// Login Start layout follows that version: the UUID is optional behind a flag
+/// from 1.19.3 to 1.20.1, and mandatory without a flag from 1.20.2 on.
+fn login_request(host: &str, port: u16, protocol: i32) -> Vec<u8> {
     let mut body = Vec::new();
     write_varint(&mut body, 0); // packet id: handshake
-    write_varint(&mut body, -1); // protocol version: any
+    write_varint(&mut body, protocol);
     write_string(&mut body, host);
     body.extend_from_slice(&port.to_be_bytes());
     write_varint(&mut body, 2); // next state: login
     let mut request = framed(body);
 
-    // Login Start carries the name and a UUID; older servers ignore the extras.
     let mut body = Vec::new();
     write_varint(&mut body, 0); // packet id: login start
     write_string(&mut body, PROBE_NAME);
-    body.push(1); // client supplied a UUID
-    body.extend_from_slice(&PROBE_UUID);
+    if protocol >= 764 {
+        // 1.20.2+: the profile UUID is mandatory.
+        body.extend_from_slice(&PROBE_UUID);
+    } else if protocol >= 761 {
+        // 1.19.3–1.20.1: optional UUID preceded by a "present" flag.
+        body.push(1);
+        body.extend_from_slice(&PROBE_UUID);
+    } else if protocol >= 759 {
+        // 1.19–1.19.2: optional signature data, declined.
+        body.push(0);
+    }
     request.extend_from_slice(&framed(body));
     request
 }
@@ -327,15 +350,17 @@ mod tests {
     }
 
     /// Accepts a login handshake and replies with a single packet id.
-    fn serve_login_reply(packet_id: i32) -> (String, u16) {
+    fn serve_login_reply(packet_id: i32, protocol: i32) -> (String, u16) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
             let mut reader = socket.try_clone().unwrap();
+            let handshake = read_packet(&mut reader);
             read_packet(&mut reader);
-            let start = read_packet(&mut reader);
-            assert_eq!(&start[start.len() - 17..start.len() - 16], &[1]);
+            let mut cursor = io::Cursor::new(handshake);
+            assert_eq!(read_varint(&mut cursor).unwrap(), 0);
+            assert_eq!(read_varint(&mut cursor).unwrap(), protocol);
 
             let mut body = Vec::new();
             write_varint(&mut body, packet_id);
@@ -361,20 +386,119 @@ mod tests {
 
     #[test]
     fn detects_online_mode_from_encryption_request() {
-        let (host, port) = serve_login_reply(PACKET_ENCRYPTION_REQUEST);
-        assert_eq!(online_mode(&host, port).unwrap(), OnlineMode::Online);
+        let (host, port) = serve_login_reply(PACKET_ENCRYPTION_REQUEST, 769);
+        assert_eq!(online_mode(&host, port, 769).unwrap(), OnlineMode::Online);
     }
 
     #[test]
     fn detects_offline_mode_from_login_success() {
-        let (host, port) = serve_login_reply(PACKET_LOGIN_SUCCESS);
-        assert_eq!(online_mode(&host, port).unwrap(), OnlineMode::Offline);
+        let (host, port) = serve_login_reply(PACKET_LOGIN_SUCCESS, 769);
+        assert_eq!(online_mode(&host, port, 769).unwrap(), OnlineMode::Offline);
     }
 
     #[test]
     fn treats_disconnect_as_unknown_mode() {
-        let (host, port) = serve_login_reply(0x00);
-        assert_eq!(online_mode(&host, port).unwrap(), OnlineMode::Unknown);
+        let (host, port) = serve_login_reply(0x00, 769);
+        assert_eq!(online_mode(&host, port, 769).unwrap(), OnlineMode::Unknown);
+    }
+
+    fn split_frames(packet: &[u8]) -> Vec<&[u8]> {
+        let mut rest = packet;
+        let mut frames = Vec::new();
+        while !rest.is_empty() {
+            let mut header = rest;
+            let length = read_varint(&mut header).unwrap() as usize;
+            let start = rest.len() - header.len();
+            frames.push(&rest[start..start + length]);
+            rest = &rest[start + length..];
+        }
+        frames
+    }
+
+    /// The Login Start body after the packet id and probe name.
+    fn login_start_tail(protocol: i32) -> Vec<u8> {
+        let request = login_request("localhost", 25565, protocol);
+        let frames = split_frames(&request);
+        assert_eq!(frames.len(), 2);
+        let mut login_start = frames[1];
+        assert_eq!(read_varint(&mut login_start).unwrap(), 0);
+        let name_length = read_varint(&mut login_start).unwrap() as usize;
+        assert_eq!(&login_start[..name_length], PROBE_NAME.as_bytes());
+        login_start[name_length..].to_vec()
+    }
+
+    #[test]
+    fn login_request_repeats_the_advertised_protocol() {
+        let request = login_request("localhost", 25565, 769);
+        let frames = split_frames(&request);
+        let mut handshake = frames[0];
+        assert_eq!(read_varint(&mut handshake).unwrap(), 0);
+        assert_eq!(read_varint(&mut handshake).unwrap(), 769);
+    }
+
+    #[test]
+    fn login_start_layout_follows_the_protocol() {
+        // 1.20.2+ expects the UUID without the legacy flag.
+        assert_eq!(login_start_tail(769), PROBE_UUID.to_vec());
+        // 1.19.3–1.20.1 expect a flag before the UUID.
+        assert_eq!(
+            login_start_tail(763),
+            [&[1u8][..], &PROBE_UUID[..]].concat()
+        );
+        // 1.19–1.19.2 expect optional signature data, declined.
+        assert_eq!(login_start_tail(760), vec![0]);
+        // Older versions expect just the name.
+        assert!(login_start_tail(758).is_empty());
+    }
+
+    #[test]
+    fn status_probes_mode_with_the_protocol_it_advertises() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut reader = socket.try_clone().unwrap();
+            read_packet(&mut reader);
+            read_packet(&mut reader);
+
+            let mut body = Vec::new();
+            write_varint(&mut body, 0);
+            write_string(
+                &mut body,
+                r#"{"version":{"name":"1.21.4","protocol":769},"players":{"online":0,"max":20},"description":{"text":"hi"}}"#,
+            );
+            let mut response = Vec::new();
+            write_varint(&mut response, body.len() as i32);
+            response.extend_from_slice(&body);
+            socket.write_all(&response).unwrap();
+            drop(socket);
+
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut reader = socket.try_clone().unwrap();
+            let handshake = read_packet(&mut reader);
+            read_packet(&mut reader);
+            let mut cursor = io::Cursor::new(handshake);
+            assert_eq!(read_varint(&mut cursor).unwrap(), 0);
+            let protocol = read_varint(&mut cursor).unwrap();
+
+            let mut body = Vec::new();
+            write_varint(
+                &mut body,
+                if protocol == 769 {
+                    PACKET_ENCRYPTION_REQUEST
+                } else {
+                    0x00 // Login Disconnect, like a version mismatch
+                },
+            );
+            let mut response = Vec::new();
+            write_varint(&mut response, body.len() as i32);
+            response.extend_from_slice(&body);
+            socket.write_all(&response).unwrap();
+        });
+
+        let status = status(&address.ip().to_string(), address.port()).unwrap();
+        assert_eq!(status.version, "1.21.4");
+        assert_eq!(status.online_mode, OnlineMode::Online);
     }
 
     #[test]
