@@ -454,6 +454,7 @@ name = "nctui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "libc",
  "quick-xml",
  "ratatui",
  "serde_json",

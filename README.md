@@ -13,7 +13,7 @@ syntax.
 
 ## Requirements
 
-- Rust (stable) to build
+- Rust 1.88 or newer to build
 - `nmap` on `PATH` only for the fallback path (`--nmap`, hostnames, nmap ranges)
 - Internet access for country range lists
 
@@ -79,7 +79,7 @@ single /24 still checks every address.
 ## Measured performance
 
 On this 8-core machine, non-root, with the default auto-tuned concurrency
-(3,968 connections, hard fd limit 4096):
+(3,968 connections, soft fd limit 4096):
 
 | Benchmark | Fast scanner | nmap |
 | --- | --- | --- |
@@ -157,8 +157,10 @@ status ping; press `p` to re-check the selected server.
 
 - Java Edition only. Bedrock Edition uses UDP 19132 and a different protocol.
 - Country mode and the fast scanner cover IPv4 only.
-- A non-root connect scan is bounded by the file-descriptor limit and the
-  ephemeral-port range. On this machine that is ~4,000 simultaneous probes.
+- A non-root connect scan is bounded by the soft file-descriptor limit and
+  the ephemeral-port range. On this machine that is ~4,000 simultaneous probes.
+- At most 64 Minecraft status probes run at once, so open ports cannot pile up
+  one thread (and one connection) each.
   Raw SYN scanning (masscan/root) is the next order-of-magnitude step but is not
   used here.
 - A full country is still tens to hundreds of millions of addresses. Use

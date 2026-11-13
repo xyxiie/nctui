@@ -13,9 +13,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use scan::ScanOptions;
-
-const DEFAULT_TARGET: &str = "192.168.1.0/24";
+use scan::{ScanOptions, DEFAULT_TARGET};
 
 fn main() -> io::Result<()> {
     let (initial_target, options) = match parse_args() {
@@ -30,22 +28,53 @@ fn main() -> io::Result<()> {
     // Restore the terminal if something panics while raw mode is active.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = ratatui::restore();
+        ratatui::restore();
         default_hook(info);
     }));
 
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    terminal.clear()?;
+    let mut session = TerminalSession::new()?;
+    session.terminal_mut().clear()?;
+    run(
+        session.terminal_mut(),
+        App::new(initial_target, options),
+    )
+}
 
-    let result = run(&mut terminal, App::new(initial_target, options));
+/// Owns the raw-mode terminal so every exit path leaves it usable again.
+struct TerminalSession {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+}
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    result
+impl TerminalSession {
+    fn new() -> io::Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+            // Raw mode is on but the guard does not exist yet, so undo it here.
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
+        match Terminal::new(CrosstermBackend::new(stdout)) {
+            Ok(terminal) => Ok(Self { terminal }),
+            Err(error) => {
+                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                let _ = disable_raw_mode();
+                Err(error)
+            }
+        }
+    }
+
+    fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<io::Stdout>> {
+        &mut self.terminal
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = self.terminal.show_cursor();
+    }
 }
 
 fn parse_args() -> Result<(Option<String>, ScanOptions), String> {

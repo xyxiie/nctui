@@ -1,7 +1,9 @@
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -18,7 +20,6 @@ use ratatui::{
 use crate::mc::{OnlineMode, Status};
 use crate::scan::{self, ScanEvent, ScanOptions};
 
-const DEFAULT_TARGET: &str = "192.168.1.0/24";
 const DEFAULT_PORT: &str = "25565";
 const ALL_VERSIONS: &str = "All versions";
 
@@ -62,6 +63,9 @@ pub struct App {
     options: ScanOptions,
     cancel: Arc<AtomicBool>,
     fast_scan: bool,
+    scan_thread: Option<JoinHandle<()>>,
+    /// Every address/port already listed, so duplicates stay O(1) to drop.
+    seen: HashSet<(String, u16)>,
     pub should_quit: bool,
     tx: Sender<ScanEvent>,
     rx: Receiver<ScanEvent>,
@@ -74,7 +78,7 @@ impl App {
             target: target
                 .map(|t| t.trim().to_string())
                 .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| DEFAULT_TARGET.to_string()),
+                .unwrap_or_else(|| scan::DEFAULT_TARGET.to_string()),
             port: DEFAULT_PORT.to_string(),
             field: Field::Target,
             editing: false,
@@ -90,6 +94,8 @@ impl App {
             options,
             cancel: Arc::new(AtomicBool::new(false)),
             fast_scan: false,
+            scan_thread: None,
+            seen: HashSet::new(),
             should_quit: false,
             tx,
             rx,
@@ -100,22 +106,35 @@ impl App {
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 ScanEvent::Host { addr, port } => {
-                    if self
-                        .entries
-                        .iter()
-                        .any(|entry| entry.addr == addr && entry.port == port)
-                    {
+                    if !self.seen.insert((addr.clone(), port)) {
                         continue;
                     }
-                    self.entries.push(Entry {
+                    let candidate = Entry {
                         addr,
                         port,
                         probe: Probe::Pending,
-                    });
-                    self.sort_entries();
+                    };
+                    // Insert in sorted position instead of re-sorting the
+                    // whole list for every hit.
+                    let position = self
+                        .entries
+                        .partition_point(|entry| entry_order(entry, &candidate).is_lt());
+                    self.entries.insert(position, candidate);
+                    // Rows only shift while no version filter hides any of them.
+                    if self.version_filter.is_none() {
+                        if let Some(selected) = self.table.selected() {
+                            if position <= selected {
+                                self.table.select(Some(selected + 1));
+                            }
+                        }
+                    }
                 }
-                ScanEvent::Server { addr, result } => {
-                    if let Some(entry) = self.entries.iter_mut().find(|entry| entry.addr == addr) {
+                ScanEvent::Server { addr, port, result } => {
+                    if let Some(entry) = self
+                        .entries
+                        .iter_mut()
+                        .find(|entry| entry.addr == addr && entry.port == port)
+                    {
                         entry.probe = match result {
                             Ok(status) => Probe::Online(status),
                             Err(reason) => Probe::Offline(reason),
@@ -251,6 +270,7 @@ impl App {
         };
 
         self.entries.clear();
+        self.seen.clear();
         self.table.select(None);
         self.scanning = true;
         self.progress = None;
@@ -264,13 +284,13 @@ impl App {
         } else {
             format!("Starting nmap scan of {target} on TCP {port}…")
         };
-        scan::spawn_scan(
+        self.scan_thread = Some(scan::spawn_scan(
             target,
             port,
             self.options.clone(),
             self.tx.clone(),
             self.cancel.clone(),
-        );
+        ));
     }
 
     fn ping_selected(&mut self) {
@@ -441,12 +461,12 @@ impl App {
         if !self.scanning {
             return;
         }
-        if self.fast_scan {
-            self.cancel.store(true, Ordering::Relaxed);
-            self.status = "Stopping fast scan…".to_string();
+        self.cancel.store(true, Ordering::Relaxed);
+        self.status = if self.fast_scan {
+            "Stopping fast scan…".to_string()
         } else {
-            self.status = "nmap scans can't be stopped — press q to quit".to_string();
-        }
+            "Stopping nmap scan…".to_string()
+        };
     }
 
     fn clear_results(&mut self) {
@@ -455,6 +475,7 @@ impl App {
             return;
         }
         self.entries.clear();
+        self.seen.clear();
         self.table.select(None);
         self.version_filter = None;
         self.picker = None;
@@ -482,31 +503,6 @@ impl App {
         } else {
             self.table.select(Some(index.min(visible - 1)));
         }
-    }
-
-    fn selected_addr(&self) -> Option<String> {
-        self.selected_entry_index()
-            .and_then(|index| self.entries.get(index))
-            .map(|entry| entry.addr.clone())
-    }
-
-    fn sort_entries(&mut self) {
-        let selected = self.selected_addr();
-        self.entries.sort_by(|a, b| match (a.addr.parse::<IpAddr>(), b.addr.parse::<IpAddr>()) {
-            (Ok(left), Ok(right)) => left.cmp(&right),
-            _ => a.addr.cmp(&b.addr),
-        });
-        if let Some(selected) = selected {
-            if let Some(index) = self
-                .visible_indices()
-                .into_iter()
-                .position(|entry_index| self.entries[entry_index].addr == selected)
-            {
-                self.table.select(Some(index));
-                return;
-            }
-        }
-        self.ensure_selection();
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
@@ -731,6 +727,29 @@ impl App {
     }
 }
 
+/// Table order: numeric IPv4 first, then anything else by text, then by port.
+fn entry_order(left: &Entry, right: &Entry) -> std::cmp::Ordering {
+    let by_addr = match (left.addr.parse::<IpAddr>(), right.addr.parse::<IpAddr>()) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        _ => left.addr.cmp(&right.addr),
+    };
+    by_addr.then(left.port.cmp(&right.port))
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // Stop the running scan; the nmap path kills and waits on its child, so
+        // wait for it rather than leaving nmap running after the UI is gone.
+        self.cancel.store(true, Ordering::Relaxed);
+        let joins = !self.fast_scan;
+        if let Some(handle) = self.scan_thread.take() {
+            if joins {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
 fn focus_style(focused: bool) -> Style {
     if focused {
         Style::new().fg(Color::Yellow)
@@ -817,6 +836,54 @@ mod tests {
         let mut app = App::new(Some("127.0.0.1".to_string()), ScanOptions::default());
         app.entries = entries;
         app
+    }
+
+    fn push(app: &mut App, event: ScanEvent) {
+        app.tx.send(event).unwrap();
+        app.drain_events();
+    }
+
+    #[test]
+    fn host_events_are_deduplicated_and_inserted_in_order() {
+        let mut app = app_with(Vec::new());
+        for addr in ["10.0.0.5", "10.0.0.2", "10.0.0.9", "10.0.0.5"] {
+            push(
+                &mut app,
+                ScanEvent::Host {
+                    addr: addr.to_string(),
+                    port: 25565,
+                },
+            );
+        }
+
+        let addrs: Vec<&str> = app.entries.iter().map(|entry| entry.addr.as_str()).collect();
+        assert_eq!(addrs, ["10.0.0.2", "10.0.0.5", "10.0.0.9"]);
+    }
+
+    #[test]
+    fn server_events_match_on_address_and_port() {
+        let mut app = app_with(Vec::new());
+        for port in [25565u16, 25566] {
+            push(
+                &mut app,
+                ScanEvent::Host {
+                    addr: "10.0.0.1".to_string(),
+                    port,
+                },
+            );
+        }
+
+        push(
+            &mut app,
+            ScanEvent::Server {
+                addr: "10.0.0.1".to_string(),
+                port: 25566,
+                result: Ok(status("1.21.4")),
+            },
+        );
+
+        assert!(matches!(app.entries[0].probe, Probe::Pending));
+        assert!(matches!(app.entries[1].probe, Probe::Online(_)));
     }
 
     #[test]

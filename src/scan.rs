@@ -2,11 +2,12 @@
 
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::Sender;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,12 +18,19 @@ use quick_xml::Reader;
 use crate::fast;
 use crate::mc;
 
+/// Default scan target, shared by the UI and `--help`.
+pub const DEFAULT_TARGET: &str = "192.168.1.0/24";
+
 #[derive(Debug, Clone)]
 pub enum ScanEvent {
     Host { addr: String, port: u16 },
     Progress(f32),
     Info(String),
-    Server { addr: String, result: Result<mc::Status, String> },
+    Server {
+        addr: String,
+        port: u16,
+        result: Result<mc::Status, String>,
+    },
     Done(String),
     Failed(String),
 }
@@ -54,11 +62,11 @@ pub fn spawn_scan(
     options: ScanOptions,
     tx: Sender<ScanEvent>,
     cancel: Arc<AtomicBool>,
-) {
+) -> thread::JoinHandle<()> {
     if !options.nmap && supports_fast(&target) {
-        thread::spawn(move || run_fast(target, port, options, tx, cancel));
+        thread::spawn(move || run_fast(target, port, options, tx, cancel))
     } else {
-        thread::spawn(move || run_nmap(target, port, tx));
+        thread::spawn(move || run_nmap(target, port, tx, cancel))
     }
 }
 
@@ -71,11 +79,91 @@ pub fn spawn_probe(addr: String, port: u16, tx: Sender<ScanEvent>) {
     let _ = probe_thread(addr, port, tx);
 }
 
-pub(crate) fn probe_thread(addr: String, port: u16, tx: Sender<ScanEvent>) -> thread::JoinHandle<()> {
+pub(crate) fn probe_thread(
+    addr: String,
+    port: u16,
+    tx: Sender<ScanEvent>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let result = mc::status(&addr, port).map_err(|error| error.0);
-        let _ = tx.send(ScanEvent::Server { addr, result });
+        let _ = tx.send(ScanEvent::Server { addr, port, result });
     })
+}
+
+/// Concurrent Minecraft probes. Each probe keeps a socket and a thread busy, so
+/// the pool is fixed-size instead of one thread (and one retained handle) per
+/// open port.
+pub(crate) const PROBE_CONCURRENCY: usize = 64;
+
+type ProbeJob = Box<dyn FnOnce() + Send>;
+
+/// A fixed-size worker pool for blocking probe jobs.
+pub(crate) struct WorkerPool {
+    sender: Mutex<Option<mpsc::Sender<ProbeJob>>>,
+    receiver: Arc<Mutex<mpsc::Receiver<ProbeJob>>>,
+    workers: Mutex<Vec<thread::JoinHandle<()>>>,
+    limit: usize,
+}
+
+impl WorkerPool {
+    pub(crate) fn new(limit: usize) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            sender: Mutex::new(Some(sender)),
+            receiver: Arc::new(Mutex::new(receiver)),
+            workers: Mutex::new(Vec::new()),
+            limit: limit.max(1),
+        }
+    }
+
+    /// Queues `job`, adding a worker per job until the limit is reached.
+    pub(crate) fn submit(&self, job: impl FnOnce() + Send + 'static) {
+        let mut workers = match self.workers.lock() {
+            Ok(workers) => workers,
+            Err(_) => return,
+        };
+        if workers.len() < self.limit {
+            let receiver = Arc::clone(&self.receiver);
+            workers.push(thread::spawn(move || loop {
+                let job = match receiver.lock() {
+                    Ok(receiver) => receiver.recv(),
+                    Err(_) => return,
+                };
+                match job {
+                    Ok(job) => job(),
+                    Err(_) => return,
+                }
+            }));
+        }
+        drop(workers);
+
+        let sender = self.sender.lock().ok();
+        if let Some(Some(sender)) = sender.as_deref() {
+            let _ = sender.send(Box::new(job));
+        }
+    }
+
+    /// Closes the queue and waits for the running probes.
+    pub(crate) fn finish(&self) {
+        if let Ok(mut sender) = self.sender.lock() {
+            sender.take();
+        }
+        let mut workers = match self.workers.lock() {
+            Ok(workers) => workers,
+            Err(_) => return,
+        };
+        for worker in workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Queues one Minecraft status probe for `addr:port` on the worker pool.
+pub(crate) fn queue_probe(pool: &WorkerPool, addr: String, port: u16, tx: Sender<ScanEvent>) {
+    pool.submit(move || {
+        let result = mc::status(&addr, port).map_err(|error| error.0);
+        let _ = tx.send(ScanEvent::Server { addr, port, result });
+    });
 }
 
 fn run_fast(
@@ -114,26 +202,7 @@ fn run_fast(
 
     match fast::scan(ranges, port, &options, tx.clone(), cancel) {
         Ok(summary) => {
-            let seconds = summary.elapsed.as_secs_f64();
-            let rate = if seconds > 0.0 {
-                summary.attempted as f64 / seconds
-            } else {
-                0.0
-            };
-            let outcome = if summary.cancelled {
-                "stopped".to_string()
-            } else if summary.limit_reached {
-                format!("stopped after {} open port(s)", summary.open)
-            } else {
-                "finished".to_string()
-            };
-            let _ = tx.send(ScanEvent::Done(format!(
-                "Fast scan {outcome} — {} addresses in {:.1}s ({}/s), {} open port(s)",
-                with_commas(summary.attempted),
-                seconds,
-                with_commas(rate as u64),
-                summary.open
-            )));
+            let _ = tx.send(ScanEvent::Done(fast_done_message(&summary)));
         }
         Err(message) => {
             let _ = tx.send(ScanEvent::Failed(message));
@@ -141,7 +210,38 @@ fn run_fast(
     }
 }
 
-fn run_nmap(target: String, port: u16, tx: Sender<ScanEvent>) {
+/// The final status line for a fast scan, including resource failures.
+fn fast_done_message(summary: &fast::Summary) -> String {
+    let seconds = summary.elapsed.as_secs_f64();
+    let rate = if seconds > 0.0 {
+        summary.attempted as f64 / seconds
+    } else {
+        0.0
+    };
+    let outcome = if summary.cancelled {
+        "stopped".to_string()
+    } else if summary.limit_reached {
+        format!("stopped after {} open port(s)", summary.open)
+    } else {
+        "finished".to_string()
+    };
+    let mut message = format!(
+        "Fast scan {outcome} — {} addresses in {:.1}s ({}/s), {} open port(s)",
+        with_commas(summary.attempted),
+        seconds,
+        with_commas(rate as u64),
+        summary.open
+    );
+    if summary.resource_failures > 0 {
+        message.push_str(&format!(
+            " — {} probes failed due to resource limits",
+            with_commas(summary.resource_failures as u64)
+        ));
+    }
+    message
+}
+
+fn run_nmap(target: String, port: u16, tx: Sender<ScanEvent>, cancel: Arc<AtomicBool>) {
     let mut target_file: Option<TargetFile> = None;
 
     if let Some(code) = country_code(&target) {
@@ -231,12 +331,25 @@ fn run_nmap(target: String, port: u16, tx: Sender<ScanEvent>) {
     });
 
     let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
         let _ = tx.send(ScanEvent::Failed("nmap stdout was unavailable".to_string()));
         return;
     };
 
+    // The guard kills and reaps nmap on every return path; the watcher lets `x`
+    // stop a scan that is producing no output at all.
+    let child = NmapChild::new(child);
+    let finished = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let slot = child.handle();
+        let cancel = Arc::clone(&cancel);
+        let finished = Arc::clone(&finished);
+        thread::spawn(move || watch_cancel(slot, cancel, finished))
+    };
+
+    let probes = WorkerPool::new(PROBE_CONCURRENCY);
     let mut found = 0usize;
-    let mut probes = Vec::new();
     let parse_result;
     {
         let tx_host = tx.clone();
@@ -246,19 +359,18 @@ fn run_nmap(target: String, port: u16, tx: Sender<ScanEvent>) {
                 addr: addr.clone(),
                 port,
             });
-            probes.push(probe_thread(addr, port, tx.clone()));
+            queue_probe(&probes, addr, port, tx.clone());
         });
         if parse_result.is_err() {
-            let _ = child.kill();
+            child.kill();
         }
     }
 
     let exit_status = child.wait();
+    finished.store(true, Ordering::Relaxed);
+    let _ = watcher.join();
     if let Some(handle) = stderr_handle {
         let _ = handle.join();
-    }
-    for probe in probes {
-        let _ = probe.join();
     }
 
     if let Err(message) = parse_result {
@@ -266,13 +378,22 @@ fn run_nmap(target: String, port: u16, tx: Sender<ScanEvent>) {
         return;
     }
 
+    if cancel.load(Ordering::Relaxed) {
+        let _ = tx.send(ScanEvent::Done(format!(
+            "nmap scan stopped — {found} host(s) with TCP {port} open so far"
+        )));
+        return;
+    }
+
+    probes.finish();
+
     match exit_status {
-        Ok(status) if status.success() => {
+        Some(Ok(status)) if status.success() => {
             let _ = tx.send(ScanEvent::Done(format!(
                 "Scan finished — {found} host(s) with TCP {port} open"
             )));
         }
-        Ok(status) => {
+        Some(Ok(status)) => {
             let detail = stderr_log
                 .lock()
                 .ok()
@@ -285,11 +406,74 @@ fn run_nmap(target: String, port: u16, tx: Sender<ScanEvent>) {
             };
             let _ = tx.send(ScanEvent::Failed(message));
         }
-        Err(error) => {
+        Some(Err(error)) => {
             let _ = tx.send(ScanEvent::Failed(format!(
                 "failed while waiting for nmap: {error}"
             )));
         }
+        None => {
+            let _ = tx.send(ScanEvent::Failed(
+                "nmap was stopped before it exited".to_string(),
+            ));
+        }
+    }
+}
+
+/// Owns the nmap child so it is always killed and reaped, on every return path.
+struct NmapChild {
+    slot: Arc<Mutex<Option<Child>>>,
+}
+
+impl NmapChild {
+    fn new(child: Child) -> Self {
+        Self {
+            slot: Arc::new(Mutex::new(Some(child))),
+        }
+    }
+
+    fn handle(&self) -> Arc<Mutex<Option<Child>>> {
+        Arc::clone(&self.slot)
+    }
+
+    fn kill(&self) {
+        kill_child(&self.slot);
+    }
+
+    fn wait(&self) -> Option<io::Result<ExitStatus>> {
+        self.slot
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .map(|mut child| child.wait())
+    }
+}
+
+impl Drop for NmapChild {
+    fn drop(&mut self) {
+        kill_child(&self.slot);
+    }
+}
+
+fn kill_child(slot: &Arc<Mutex<Option<Child>>>) {
+    let child = slot.lock().ok().and_then(|mut slot| slot.take());
+    if let Some(mut child) = child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Kills nmap as soon as the scan is cancelled, even when it prints no hosts.
+fn watch_cancel(
+    slot: Arc<Mutex<Option<Child>>>,
+    cancel: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+) {
+    while !finished.load(Ordering::Relaxed) {
+        if cancel.load(Ordering::Relaxed) {
+            kill_child(&slot);
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -467,14 +651,14 @@ fn fetch_zone(
         let received_before = body.len();
 
         match download_once(agent, url, code, &mut body, &mut total) {
-            Ok(()) if total.map_or(true, |total| body.len() >= total) => {
+            Ok(true) => {
                 let ranges = parse_ranges(&String::from_utf8_lossy(&body));
                 if ranges.is_empty() {
                     return Err(format!("no IPv4 ranges found for country code {code}"));
                 }
                 return Ok(ranges);
             }
-            Ok(()) => {
+            Ok(false) => {
                 last_error =
                     format!("could not read IPv4 ranges for {code}: connection closed early");
             }
@@ -516,15 +700,18 @@ fn download_status(code: &str, received: usize, total: Option<usize>) -> String 
 }
 
 /// Appends the next part of the zone file to `body`, continuing where the last
-/// attempt stopped. Returns `Ok(())` once the connection ends, which may still
-/// be a truncated body; the caller checks that against the content length.
+/// attempt stopped.
+///
+/// Returns whether the body is complete: the content length must be satisfied,
+/// or, when the server sends no length, the body has to end on a line boundary
+/// so a connection that closes early cannot look like a whole zone file.
 fn download_once(
     agent: &ureq::Agent,
     url: &str,
     code: &str,
     body: &mut Vec<u8>,
     total: &mut Option<usize>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let response = match agent
         .get(url)
         .set("Range", &format!("bytes={}-", body.len()))
@@ -532,7 +719,9 @@ fn download_once(
     {
         Ok(response) => response,
         // Requested offset is past the end: the file is already complete.
-        Err(ureq::Error::Status(416, _)) if !body.is_empty() => return Ok(()),
+        Err(ureq::Error::Status(416, _)) if !body.is_empty() => {
+            return Ok(body_is_complete(body, *total));
+        }
         Err(ureq::Error::Status(404, _)) => {
             return Err(format!("unknown country code {code} (no IPv4 ranges found)"));
         }
@@ -557,7 +746,7 @@ fn download_once(
     let mut chunk = [0u8; 16 * 1024];
     loop {
         match reader.read(&mut chunk) {
-            Ok(0) => return Ok(()),
+            Ok(0) => return Ok(body_is_complete(body, *total)),
             Ok(count) => {
                 body.extend_from_slice(&chunk[..count]);
                 if body.len() > MAX_RANGE_BYTES {
@@ -572,17 +761,38 @@ fn download_once(
     }
 }
 
+/// Whether a downloaded body is known to be whole.
+fn body_is_complete(body: &[u8], total: Option<usize>) -> bool {
+    match total {
+        Some(total) => body.len() >= total,
+        None => body.last() == Some(&b'\n'),
+    }
+}
+
+/// Parses a zone file body.
+///
+/// Only complete lines are used: a body that stops mid-line is a truncated
+/// download, and a cut-off `1.2.3.0/2` must not pass as a valid `/2` range.
 fn parse_ranges(body: &str) -> Vec<String> {
-    body.lines()
-        .map(str::trim)
-        .filter(|line| {
-            !line.is_empty()
-                && !line.starts_with('#')
-                && line.contains('/')
-                && !line.contains(char::is_whitespace)
-        })
-        .map(str::to_string)
-        .collect()
+    let complete = match body.rfind('\n') {
+        Some(end) => &body[..=end],
+        None => return Vec::new(),
+    };
+    complete.lines().filter_map(parse_range_line).collect()
+}
+
+fn parse_range_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let (address, prefix) = line.split_once('/')?;
+    let address: Ipv4Addr = address.parse().ok()?;
+    let prefix: u8 = prefix.parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    Some(format!("{address}/{prefix}"))
 }
 
 fn write_target_list(code: &str, ranges: &[String]) -> Result<TargetFile, String> {
@@ -604,7 +814,9 @@ mod tests {
     use super::*;
     use std::io::{Cursor, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
+    use std::time::Instant;
 
     #[test]
     fn resumes_an_interrupted_range_download() {
@@ -742,5 +954,183 @@ mod tests {
         let line = "Stats: 0:00:03 elapsed; 0 hosts completed (1 up), 1 undergoing SYN Stealth Scan\nAbout 12.34% done";
         assert_eq!(parse_progress(line), Some(12.34));
         assert_eq!(parse_progress("Nmap done: 1 IP address"), None);
+    }
+
+    #[test]
+    fn ignores_a_cut_off_last_line() {
+        // `1.2.3.0/2` is a valid /2 CIDR but the line was cut off, so only the
+        // newline-terminated line survives.
+        assert_eq!(parse_ranges("10.0.0.0/8\n1.2.3.0/2"), vec!["10.0.0.0/8"]);
+        assert!(parse_ranges("10.0.0.0/8").is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_range_lines() {
+        let body = "10.0.0.0/8\n10.0.0.0/33\nnot-a-cidr\n10.0.0/8\n10.0.0.0\n\n# comment\n192.168.0.0/16\n";
+        assert_eq!(parse_ranges(body), vec!["10.0.0.0/8", "192.168.0.0/16"]);
+    }
+
+    fn http_listener(response: &'static [u8]) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((mut socket, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut line = String::new();
+                while reader
+                    .read_line(&mut line)
+                    .map(|read| read > 0)
+                    .unwrap_or(false)
+                {
+                    if line == "\r\n" {
+                        break;
+                    }
+                    line.clear();
+                }
+                let _ = socket.write_all(response);
+            }
+        });
+        address
+    }
+
+    fn fetch_test_zone(address: std::net::SocketAddr) -> Result<Vec<String>, String> {
+        let (tx, _rx) = mpsc::channel();
+        let agent = ureq::AgentBuilder::new().build();
+        let url = format!("http://{address}/zone.zone");
+        fetch_zone(&agent, &url, "ZZ", &tx)
+    }
+
+    #[test]
+    fn rejects_a_chunked_download_cut_off_mid_line() {
+        // A well-formed chunked response whose last line was cut off: there is
+        // no content length, so the missing newline is the only signal.
+        let address = http_listener(
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n14\r\n10.0.0.0/8\n1.2.3.0/2\r\n0\r\n\r\n",
+        );
+        let error = fetch_test_zone(address).unwrap_err();
+        assert!(error.contains("download incomplete"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_truncated_chunked_body() {
+        // The connection closes mid-chunk, without a terminating chunk.
+        let address = http_listener(
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n14\r\n10.0.0.0/8\n1.2.3.0/2",
+        );
+        let error = fetch_test_zone(address).unwrap_err();
+        assert!(error.contains("download incomplete"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_body_shorter_than_its_content_length() {
+        let address = http_listener(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\nconnection: close\r\n\r\n10.0.0.0/8\n192.168.0.0/16\n",
+        );
+        let error = fetch_test_zone(address).unwrap_err();
+        assert!(error.contains("download incomplete"), "{error}");
+    }
+
+    #[test]
+    fn accepts_a_complete_chunked_download() {
+        let address = http_listener(
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n1a\r\n10.0.0.0/8\n192.168.0.0/16\n\r\n0\r\n\r\n",
+        );
+        let ranges = fetch_test_zone(address).unwrap();
+        assert_eq!(ranges, vec!["10.0.0.0/8", "192.168.0.0/16"]);
+    }
+
+    #[test]
+    fn probe_pool_never_exceeds_its_limit() {
+        let pool = WorkerPool::new(4);
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = mpsc::channel();
+
+        for _ in 0..40 {
+            let running = Arc::clone(&running);
+            let peak = Arc::clone(&peak);
+            let done_tx = done_tx.clone();
+            pool.submit(move || {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(10));
+                running.fetch_sub(1, Ordering::SeqCst);
+                let _ = done_tx.send(());
+            });
+        }
+
+        pool.finish();
+
+        assert_eq!(done_rx.try_iter().count(), 40);
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak > 1, "probes should overlap, peak={peak}");
+        assert!(peak <= 4, "peak {peak} exceeds the pool limit");
+    }
+
+    #[test]
+    fn dropping_the_guard_kills_and_reaps_the_child() {
+        let child = match Command::new("sleep").arg("30").spawn() {
+            Ok(child) => child,
+            // No `sleep` on this platform: nothing to exercise.
+            Err(_) => return,
+        };
+        let started = Instant::now();
+        drop(NmapChild::new(child));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "drop waited for the child instead of killing it"
+        );
+    }
+
+    #[test]
+    fn cancel_kills_the_nmap_child() {
+        let child = match Command::new("sleep").arg("30").spawn() {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let guard = NmapChild::new(child);
+        let finished = Arc::new(AtomicBool::new(false));
+        watch_cancel(
+            guard.handle(),
+            Arc::new(AtomicBool::new(true)),
+            Arc::clone(&finished),
+        );
+
+        assert!(
+            guard.wait().is_none(),
+            "the cancelled child should already be reaped"
+        );
+        assert!(!finished.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn done_message_reports_resource_failures() {
+        let summary = fast::Summary {
+            attempted: 100,
+            open: 2,
+            elapsed: Duration::from_secs(2),
+            cancelled: false,
+            limit_reached: false,
+            resource_failures: 3,
+        };
+        let message = fast_done_message(&summary);
+        assert!(message.contains("2 open port(s)"), "{message}");
+        assert!(
+            message.contains("3 probes failed due to resource limits"),
+            "{message}"
+        );
+
+        let quiet = fast::Summary {
+            attempted: 100,
+            open: 2,
+            elapsed: Duration::from_secs(2),
+            cancelled: false,
+            limit_reached: false,
+            resource_failures: 0,
+        };
+        assert!(!fast_done_message(&quiet).contains("resource limits"));
     }
 }
