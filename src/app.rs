@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::{self, Write};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -187,7 +188,8 @@ impl App {
             KeyCode::Char('v') => self.open_version_picker(),
             KeyCode::Char('p') => self.ping_selected(),
             KeyCode::Char('x') => self.stop_scan(),
-            KeyCode::Char('c') => self.clear_results(),
+            KeyCode::Char('c') => self.copy_selected(),
+            KeyCode::Char('C') => self.clear_results(),
             KeyCode::Down | KeyCode::Char('j') => self.select_offset(1),
             KeyCode::Up | KeyCode::Char('k') => self.select_offset(-1),
             KeyCode::PageDown => self.select_offset(10),
@@ -469,6 +471,22 @@ impl App {
         };
     }
 
+    fn copy_selected(&mut self) {
+        let Some(addr) = self
+            .selected_entry_index()
+            .and_then(|index| self.entries.get(index))
+            .map(|entry| entry.addr.clone())
+        else {
+            self.status = "Nothing selected to copy".to_string();
+            return;
+        };
+
+        self.status = match write_clipboard(&addr) {
+            Ok(()) => format!("Copied {addr} to clipboard"),
+            Err(error) => format!("Error: could not copy {addr}: {error}"),
+        };
+    }
+
     fn clear_results(&mut self) {
         if self.scanning {
             self.status = "Cannot clear results while scanning".to_string();
@@ -681,7 +699,7 @@ impl App {
     }
 
     fn draw_footer(&mut self, frame: &mut Frame, area: Rect) {
-        let keys = " s scan  i edit  x stop  v version  p ping  c clear  ↑↓ select  q quit";
+        let keys = " s scan  i edit  x stop  v version  p ping  c copy  C clear  ↑↓ select  q quit";
         frame.render_widget(
             Paragraph::new(keys).style(Style::new().fg(Color::DarkGray)),
             area,
@@ -725,6 +743,50 @@ impl App {
         frame.render_widget(Clear, area);
         frame.render_stateful_widget(list, area, &mut picker.state);
     }
+}
+
+/// Copies `text` through the terminal with OSC 52, so no system clipboard
+/// library is needed and it also works over SSH. Terminals without OSC 52
+/// support ignore the sequence.
+fn write_clipboard(text: &str) -> io::Result<()> {
+    let tmux = std::env::var_os("TMUX").is_some();
+    let mut stdout = io::stdout();
+    stdout.write_all(osc52_sequence(text, tmux).as_bytes())?;
+    stdout.flush()
+}
+
+fn osc52_sequence(text: &str, tmux: bool) -> String {
+    let payload = base64(text.as_bytes());
+    if tmux {
+        // tmux drops unrecognised sequences unless they arrive as passthrough.
+        format!("\x1bPtmux;\x1b\x1b]52;c;{payload}\x07\x1b\\")
+    } else {
+        format!("\x1b]52;c;{payload}\x07")
+    }
+}
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(BASE64[(b0 >> 2) as usize] as char);
+        out.push(BASE64[(((b0 & 0b11) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            BASE64[(((b1 & 0b1111) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            BASE64[(b2 & 0b111111) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// Table order: numeric IPv4 first, then anything else by text, then by port.
@@ -906,6 +968,35 @@ mod tests {
             app.version_choices().join(","),
             "All versions,1.20.4,1.21.4"
         );
+    }
+
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn osc52_sequence_wraps_ips_and_tmux_passthrough() {
+        assert_eq!(
+            osc52_sequence("10.0.0.1", false),
+            "\x1b]52;c;MTAuMC4wLjE=\x07"
+        );
+        assert_eq!(
+            osc52_sequence("10.0.0.1", true),
+            "\x1bPtmux;\x1b\x1b]52;c;MTAuMC4wLjE=\x07\x1b\\"
+        );
+    }
+
+    #[test]
+    fn clear_shortcut_is_uppercase_c() {
+        let mut app = app_with(vec![entry("10.0.0.1", None)]);
+        app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT));
+        assert!(app.entries.is_empty());
+        assert_eq!(app.status, "Cleared results");
     }
 
     #[test]

@@ -109,8 +109,13 @@ cargo test --release fast::tests::benchmark_filtered -- --ignored --nocapture
 | `x` | Stop the running fast scan |
 | `v` | Select a Minecraft version filter |
 | `p` | Re-run the Minecraft ping (and mode check) on the selected host |
-| `c` | Clear results and the version filter |
+| `c` | Copy the selected IP to the clipboard |
+| `C` | Clear results and the version filter |
 | `q` / `Ctrl-C` | Quit |
+
+Copying uses the terminal's OSC 52 sequence, so no system clipboard library
+is needed and it also works over SSH. Terminals without OSC 52 support ignore
+the copy; tmux is handled through its passthrough sequence.
 
 ## Version filter
 
@@ -118,7 +123,7 @@ Press `v` to open a picker populated with the versions reported by the servers
 found so far, plus **All versions**. Selecting one filters the table to matching
 servers; `Esc` cancels, and choosing All versions clears the filter. Matching is
 case-insensitive and also accepts brand-prefixed versions such as
-`Paper 1.20.4`. The filter persists across new scans and is cleared by `c`.
+`Paper 1.20.4`. The filter persists across new scans and is cleared by `C`.
 
 ## Online vs. offline mode
 

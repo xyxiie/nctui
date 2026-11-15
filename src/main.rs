@@ -161,7 +161,7 @@ fn print_help() {
            -h, --help           show this help\n\n\
          IPv4 ranges and country codes use the built-in connect scanner; nmap is\n\
          used for hostnames and other target syntax. In the TUI: s scan, x stop,\n\
-         q quit."
+         c copy the selected IP, q quit."
     );
 }
 
